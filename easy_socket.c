@@ -586,6 +586,37 @@ int AcceptSocket(int sockfd, struct sockaddr_storage *sa, socklen_t *len)
 	return fd;
 }
 
+int AcceptSocket1(int sockfd, struct sockaddr_storage *sa, socklen_t *len, int timeout)
+{
+    int ret;
+    fd_set readfds;
+    socklen_t nnn;
+    struct timeval tv_out;
+    struct sockaddr_storage sin;
+
+    if (timeout <= 0)
+        timeout = 10;
+
+    tv_out.tv_sec = timeout / 1000;
+    tv_out.tv_usec = (timeout % 1000) * 1000;
+
+    FD_ZERO(&readfds);
+    FD_SET(sockfd, &readfds);
+
+    ret = select(sockfd + 1, &readfds, NULL, NULL, &tv_out);
+    if (ret <= 0)
+    {
+        return -1;
+    }
+
+    nnn = sizeof(sin);
+    if (sa == NULL)
+        sa = &sin;
+
+    ret = accept(sockfd, (struct sockaddr *)sa, len ? len : &nnn);
+    return ret;
+}
+
 /*
  * 非阻塞连接指定的服务地址
  * sockfd：套接字句柄
@@ -754,38 +785,46 @@ int TcpListenSocket(const char *host, const char *service, int backlog)
 int TcpRecvSocket(int sockfd, void *msg, size_t length, int timeout)
 {
 	int ret = 0;
-	fd_set rset;
-	struct timeval tv;
+	int len = 0;
+	fd_set readfds;
+	struct timeval tv_out;
+	char *ptr = (char *)msg;
 
-retry_:
-	do
+	while (len < length)
 	{
-		ret = recv(sockfd, msg, length, 0);
-	} while (ret == -1 && errno == EINTR);
-	
-	if (ret == -1)
-	{
-		if (errno != EAGAIN)
+		tv_out.tv_sec = timeout / 1000;
+		tv_out.tv_usec = (timeout % 1000) * 1000;
+
+		FD_ZERO(&readfds);
+		FD_SET(sockfd, &readfds);
+
+		ret = select(sockfd + 1, &readfds, NULL, NULL, &tv_out);
+		if (ret == 0) // 超时
 		{
-			return -1;
+			return len;
 		}
-		
-		FD_ZERO(&rset);
-		FD_SET(sockfd, &rset);
-		
-		tv.tv_sec = timeout / 1000;
-		tv.tv_usec = (timeout % 1000) * 1000;
-		do
+
+		if (ret == -1) // 出错
 		{
-			ret = select(sockfd+1, &rset, NULL, NULL, &tv);
-		} while (ret == -1 && errno == EINTR);
-		
-		if (ret == -1 || ret == 0)
-			return -1;
-		goto retry_;
+			return len;
+		}
+
+		if (FD_ISSET(sockfd, &readfds))
+		{
+			ret = recv(sockfd, ptr + len, length - len, 0);
+			if (ret == -1)
+			{
+				if (EINPROGRESS != errno && EINTR != errno)
+					return len;
+			}
+			else if (ret == 0)
+				return len;
+			else
+				len += ret;
+		}
 	}
-	
-	return ret;
+
+	return len;
 }
 
 /*
@@ -798,44 +837,42 @@ retry_:
  */
 int TcpSendSocket(int sockfd, const void *msg, size_t length, int timeout)
 {
-    int ret;
-    size_t pos;
-    fd_set wset;
-    struct timeval tv;
-    char *pmsg = (char *)msg;
+    int ret = 0;
+    int len = 0;
+    fd_set writefds;
+    struct timeval tv_out;
+    const char *ptr = (const char *)msg;
 
-    for (pos=0; pos<length;)
+    while (len < length)
     {
-        do {
-            ret = send(sockfd, pmsg + pos, length - pos, 0);
-        } while (ret == -1 && errno == EINTR);
+        tv_out.tv_sec = timeout / 1000;
+        tv_out.tv_usec = (timeout % 1000) * 1000;
+
+        FD_ZERO(&writefds);
+        FD_SET(sockfd, &writefds);
+
+        ret = select(sockfd + 1, NULL, &writefds, NULL, &tv_out);
+        if (ret == 0)
+        {
+            return -1;
+        }
 
         if (ret == -1)
         {
-            if (errno != EAGAIN)
-            {
-				return -1;
-			}
-
-            FD_ZERO(&wset);
-            FD_SET(sockfd, &wset);
-
-            tv.tv_sec = timeout / 1000;
-            tv.tv_usec = (timeout % 1000) * 1000;
-
-            do {
-                ret = select(sockfd + 1, NULL, &wset, NULL, &tv); 
-            } while (ret == -1 && errno == EINTR);
-
-            if (ret == -1 || ret == 0)
-            {
-                return -1;
-            }
+            return -2;
         }
-        pos += ret;
+
+        ret = send(sockfd, ptr + len, length - len, 0);
+        if (ret == -1)
+        {
+            if (EINPROGRESS != errno)
+                return -3;
+        }
+        else
+            len += ret;
     }
 
-    return pos;
+    return len;
 }
 
 /*
@@ -892,44 +929,45 @@ int UdpListenSocket(const char *host, const char *service)
  */
 int UdpRecvSocket(int sockfd, void *msg, size_t length, int timeout, struct sockaddr_storage *peer_addr)
 {
-	int ret = 0;
-	fd_set rset;
-	struct timeval tv;
+	int retlen = 0;
+	socklen_t usize;
+	int len = length;
+	char *buf = (char *)msg;
 	struct sockaddr_storage user_addr;
-	unsigned int usize = sizeof(user_addr);
-
-retry_:
-	do
+	
+	usize = sizeof(user_addr);
+	if (timeout > 0)
 	{
-		ret = recvfrom(sockfd, msg, length, 0, (struct sockaddr *)&user_addr, &usize);
-	} while (ret == -1 && errno == EINTR);
-
-	if (ret == -1)
-	{
-		if (errno != EAGAIN)
-		{
-			return -1;
-		}
-
-		FD_ZERO(&rset);
-		FD_SET(sockfd, &rset);
+		fd_set fdread;
+		int rc;
+		struct timeval tv;
 
 		tv.tv_sec = timeout / 1000;
 		tv.tv_usec = (timeout % 1000) * 1000;
-		do
-		{
-			ret = select(sockfd+1, &rset, NULL, NULL, &tv);
-		} while (ret == -1 && errno == EINTR);
+		FD_ZERO(&fdread);
+		FD_SET(sockfd, &fdread);
 
-		if (ret == -1 || ret == 0)
+		rc = select(sockfd + 1, &fdread, NULL, NULL, &tv);
+		if (rc < 0)
 			return -1;
-		goto retry_;
+		if (rc == 0)
+			return -1;
+
+		retlen = recvfrom(sockfd, buf, len, 0, (struct sockaddr *)&user_addr, &usize);
+		if (retlen <= 0)
+			return -1;
+
+		if (peer_addr != NULL)
+			memcpy(peer_addr, &user_addr, sizeof(user_addr));
+	}
+	else
+	{
+		retlen = recvfrom(sockfd, buf, len, 0, (struct sockaddr *)&user_addr, &usize);
+		if (peer_addr != NULL)
+			memcpy(peer_addr, &user_addr, sizeof(user_addr));
 	}
 
-	if (peer_addr)
-		memcpy(peer_addr, &user_addr, sizeof(user_addr));
-
-	return ret;
+	return retlen;
 }
 
 /*
