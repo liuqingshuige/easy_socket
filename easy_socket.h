@@ -172,6 +172,7 @@ int ListenSocket(int sockfd, int backlog);
  * return：client fd on success，-1 on fail
  */
 int AcceptSocket(int sockfd, struct sockaddr_storage *sa, socklen_t *len);
+int AcceptSocket1(int sockfd, struct sockaddr_storage *sa, socklen_t *len, int timeout);
 
 /*
  * 非阻塞连接指定的服务地址
